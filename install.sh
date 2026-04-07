@@ -9,7 +9,7 @@
 #   --renew-key  : сгенерировать новый ee-секрет и перезапустить прокси
 #
 
-set -euo pipefail
+set -uo pipefail
 
 # ================= КОНФИГУРАЦИЯ =================
 PROXY_DIR="/opt/mtg-ee-proxy"
@@ -33,15 +33,103 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# ================= ФУНКЦИИ =================
+# ================= УТИЛИТЫ =================
+
+# Попытка установить пакет, если команда не найдена
+ensure_command() {
+    local cmd="$1"
+    local package="${2:-$cmd}"
+    
+    if ! command -v "$cmd" &>/dev/null; then
+        log_warn "Команда '$cmd' не найдена. Попытка установки пакета '$package'..."
+        apt-get update -qq >/dev/null 2>&1 || true
+        if apt-get install -y -qq "$package" >/dev/null 2>&1; then
+            log_info "✅ Пакет '$package' установлен"
+            return 0
+        else
+            log_error "Не удалось установить пакет '$package'. Попробуйте вручную: apt install $package"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Установка базовых зависимостей в начале скрипта
+install_prerequisites() {
+    log_info "📦 Проверка и установка базовых зависимостей..."
+    
+    # Обновляем кэш пакетов один раз
+    apt-get update -qq >/dev/null 2>&1 || true
+    
+    # Список критичных пакетов
+    local packages=("curl" "gnupg" "apt-transport-https" "ca-certificates" "cron" "openssl")
+    
+    for pkg in "${packages[@]}"; do
+        ensure_command "$pkg" "$pkg" || true
+    done
+    
+    # Дополнительно: если не установлен getent (из libc-bin), пробуем установить
+    ensure_command "getent" "libc-bin" || true
+    
+    log_info "✅ Базовые зависимости проверены"
+}
+
+# Получение публичного IP через несколько сервисов (fallback)
+get_public_ip() {
+    local ip
+    for service in "https://api.ipify.org" "https://ifconfig.me/ip" "https://icanhazip.com" "https://ident.me"; do
+        ip=$(curl -s --connect-timeout 5 --max-time 10 "$service" 2>/dev/null | tr -d '\r\n' | head -1)
+        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Валидация IP (публичный, не локальный)
+is_valid_public_ip() {
+    local ip="$1"
+    # Базовая проверка формата
+    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        return 1
+    fi
+    # Проверка на приватные/зарезервированные диапазоны
+    if [[ "$ip" =~ ^(127\.|0\.|10\.|100\.6[4-9]\.|100\.[7-9][0-9]\.|100\.1[0-1][0-9]\.|127\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.0\.0\.|192\.0\.2\.|192\.168\.|198\.18\.|198\.19\.|198\.51\.100\.|203\.0\.113\.|22[4-9]\.|23[0-9]\.) ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Валидация домена (базовая RFC 1123)
+is_valid_domain() {
+    local domain="$1"
+    if [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Проверка, резолвится ли домен (через getent, без dig)
+domain_resolves() {
+    local domain="$1"
+    if getent hosts "$domain" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+# ================= ФУНКЦИИ УПРАВЛЕНИЯ =================
 
 show_key() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_error "Файл конфигурации не найден: $CONFIG_FILE"
         exit 1
     fi
-    local secret
+    local secret server
     secret=$(grep -E '^secret\s*=' "$CONFIG_FILE" | sed -E 's/secret\s*=\s*"([^"]+)".*/\1/')
+    server=$(grep -E '^server\s*=' "$CONFIG_FILE" 2>/dev/null | sed 's/.*= *"\(.*\)".*/\1/' || echo '<не-указан>')
+    
     if [[ -z "$secret" ]]; then
         log_error "Не удалось извлечь секрет из конфигурации"
         exit 1
@@ -51,9 +139,9 @@ show_key() {
     echo "│ $secret"
     echo "└─────────────────────────────────────────┘"
     echo -e "\n${YELLOW}Настройки для Telegram:${NC}"
-    echo "  Тип: MTProto"
-    echo "  Сервер: $(grep -E '^server\s*=' "$CONFIG_FILE" 2>/dev/null | sed 's/.*= *"\(.*\)".*/\1/' || echo '<ваш-домен-или-IP>')"
-    echo "  Порт: 443"
+    echo "  Тип:    MTProto"
+    echo "  Сервер: $server"
+    echo "  Порт:   443"
     echo "  Секрет: $secret"
     echo -e "\n${YELLOW}💡 Скопируйте секрет целиком (начинается с ee)${NC}\n"
     exit 0
@@ -67,11 +155,9 @@ renew_key() {
         exit 1
     fi
     
-    # Извлекаем текущий server для генерации (не влияет на работу, но нужен для команды)
     local server
     server=$(grep -E '^server\s*=' "$CONFIG_FILE" 2>/dev/null | sed 's/.*= *"\(.*\)".*/\1/' || echo "proxy.local")
     
-    # Генерируем новый HEX-секрет с префиксом ee
     local new_secret
     new_secret=$(docker run --rm "$IMAGE_TAG" generate-secret --hex "$server" 2>/dev/null | tr -d '\r\n')
     
@@ -80,10 +166,8 @@ renew_key() {
         exit 1
     fi
     
-    # Обновляем config.toml
     sed -i "s/^secret\s*=\s*\"[^\"]*\"/secret = \"$new_secret\"/" "$CONFIG_FILE"
     
-    # Перезапускаем контейнер
     cd "$PROXY_DIR"
     docker compose restart "$CONTAINER_NAME" >/dev/null 2>&1 || docker restart "$CONTAINER_NAME" >/dev/null 2>&1
     
@@ -96,95 +180,68 @@ renew_key() {
     exit 0
 }
 
+# ================= УСТАНОВКА =================
+
 install_docker() {
-    if command -v docker &>/dev/null && docker info &>/dev/null; then
+    if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
         log_info "Docker уже установлен"
         return 0
     fi
     
     log_info "📦 Установка Docker..."
-    apt-get update -qq
-    apt-get install -y -qq curl gnupg apt-transport-https ca-certificates software-properties-common
     
-    # Добавляем официальный репозиторий Docker
+    # Устанавливаем зависимости через ensure_command
+    ensure_command "curl" "curl"
+    ensure_command "gpg" "gnupg"
+    ensure_command "apt-transport-https" "apt-transport-https"
+    
     install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    curl -fsSL https://download.docker.com/linux/debian/gpg 2>/dev/null | gpg --dearmor -o /etc/apt/keyrings/docker.gpg || true
     chmod a+r /etc/apt/keyrings/docker.gpg
     
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
     
-    apt-get update -qq
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin >/dev/null 2>&1
     
-    # Включаем автозагрузку Docker
     systemctl enable --now docker >/dev/null 2>&1 || true
     log_info "✅ Docker установлен"
 }
 
-validate_input() {
-    local input="$1"
-    # Проверка IP (публичный, не локальный)
-    if [[ "$input" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-        if [[ "$input" =~ ^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.) ]]; then
-            return 1
-        fi
-        return 0  # Валидный публичный IP
-    fi
-    # Проверка домена (базовая)
-    if [[ "$input" =~ ^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
-        return 0
-    fi
-    return 1
-}
-
 get_certificate() {
-    local target="$1"  # domain or IP
-    local is_ip="$2"   # true/false
+    local target="$1"
+    local is_ip="$2"
     
     log_info "🔐 Запрос реального TLS-сертификата для: $target"
     
-    # Устанавливаем certbot
-    if ! command -v certbot &>/dev/null; then
-        apt-get install -y -qq certbot
-    fi
+    ensure_command "certbot" "certbot" || {
+        # Если certbot не в репозиториях, пробуем установить через snap или pip
+        if command -v snap &>/dev/null; then
+            snap install core; snap refresh core >/dev/null 2>&1 || true
+            snap install --classic certbot >/dev/null 2>&1 || true
+            ln -sf /snap/bin/certbot /usr/bin/certbot 2>/dev/null || true
+        fi
+        if ! command -v certbot &>/dev/null; then
+            apt-get install -y -qq python3-certbot >/dev/null 2>&1 || true
+        fi
+    }
     
-    # Определяем метод челленджа
-    local challenge_flag="--standalone"
-    local pre_hook="--pre-hook \"systemctl stop nginx 2>/dev/null || true\""
-    local post_hook="--post-hook \"systemctl start nginx 2>/dev/null || true\""
+    local challenge_flag="--standalone --preferred-challenges http"
     
-    # Для IP-адресов Let's Encrypt требует tls-alpn-01 или http-01
-    if [[ "$is_ip" == "true" ]]; then
-        # Пробуем http-01 (проще, требует только порт 80)
-        challenge_flag="--standalone --preferred-challenges http"
-        log_warn "Для IP-сертификатов убедитесь, что порт 80 открыт и доступен из интернета"
-    fi
-    
-    # Пробуем получить сертификат через Let's Encrypt
     log_info "🔄 Запрос сертификата через Let's Encrypt..."
     
     if [[ "$is_ip" == "true" ]]; then
-        # Для IP используем --ip-адрес в certbot (поддержка с 2024)
-        if ! certbot certonly $challenge_flag \
+        certbot certonly $challenge_flag \
             --agree-tos --no-eff-email --email "admin@${target}.local" \
             --ip-addresses "$target" \
-            --keep-until-expiring --non-interactive 2>/dev/null; then
-            log_warn "Let's Encrypt не выдал сертификат для IP. Пробуем ZeroSSL..."
-            # Fallback: ZeroSSL через acme.sh (упрощённо)
-            return 1
-        fi
+            --keep-until-expiring --non-interactive >/dev/null 2>&1 || return 1
     else
-        # Для домена
-        if ! certbot certonly $challenge_flag \
+        certbot certonly $challenge_flag \
             --agree-tos --no-eff-email --email "admin@$target" \
             -d "$target" \
-            --keep-until-expiring --non-interactive 2>/dev/null; then
-            log_warn "Let's Encrypt не выдал сертификат. Попробуйте позже или проверьте DNS."
-            return 1
-        fi
+            --keep-until-expiring --non-interactive >/dev/null 2>&1 || return 1
     fi
     
-    # Проверяем, что сертификат создан
     local cert_path="${CERT_DIR}/live/${target}/fullchain.pem"
     local key_path="${CERT_DIR}/live/${target}/privkey.pem"
     
@@ -200,7 +257,6 @@ get_certificate() {
 setup_autorenew() {
     log_info "⏰ Настройка автообновления сертификатов..."
     
-    # Создаём cron-задачу
     cat > "$CRON_FILE" << 'EOF'
 # Автообновление TLS-сертификатов для mtg-proxy
 0 3 * * * root /usr/bin/certbot renew --quiet --post-hook "docker restart mtg-proxy 2>/dev/null || true"
@@ -208,11 +264,8 @@ EOF
     
     chmod 644 "$CRON_FILE"
     
-    # Проверяем cron
-    if ! command -v cron &>/dev/null && ! command -v crond &>/dev/null; then
-        apt-get install -y -qq cron >/dev/null 2>&1 || true
-        systemctl enable --now cron >/dev/null 2>&1 || true
-    fi
+    ensure_command "cron" "cron"
+    systemctl enable --now cron >/dev/null 2>&1 || true
     
     log_info "✅ Автообновление настроено (ежедневно в 03:00)"
 }
@@ -222,11 +275,8 @@ generate_config() {
     local secret="$2"
     
     log_info "⚙️ Создание конфигурации..."
-    
-    # Создаём директорию
     mkdir -p "$PROXY_DIR"
     
-    # Создаём config.toml
     cat > "$CONFIG_FILE" << EOF
 # MTProto Proxy Configuration (9seconds/mtg)
 # Generated: $(date -Iseconds)
@@ -245,7 +295,6 @@ adtag = "ee-proxy-$(echo "$target" | tr -cd 'a-zA-Z0-9' | head -c 12)"
 log-level = "info"
 EOF
 
-    # Создаём docker-compose.yml
     cat > "$COMPOSE_FILE" << 'EOF'
 version: '3.8'
 
@@ -254,20 +303,18 @@ services:
     image: nineseconds/mtg:2
     container_name: mtg-proxy
     restart: unless-stopped
-    network_mode: host  # Критично для Fake TLS / SNI
+    network_mode: host
     
     volumes:
       - ./config.toml:/config.toml:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro  # Монтируем сертификаты
+      - /etc/letsencrypt:/etc/letsencrypt:ro
     
-    # Ограничение ресурсов
     deploy:
       resources:
         limits:
           memory: 256M
           cpus: '0.5'
     
-    # Логирование
     logging:
       driver: "json-file"
       options:
@@ -280,16 +327,12 @@ EOF
 
 start_proxy() {
     log_info "🚀 Запуск MTProto-прокси..."
-    
     cd "$PROXY_DIR"
     
-    # Проверяем, что сертификаты доступны для чтения
     chmod 644 "${CERT_DIR}/live/"*/fullchain.pem 2>/dev/null || true
     chmod 600 "${CERT_DIR}/live/"*/privkey.pem 2>/dev/null || true
     
-    # Запускаем
     if ! docker compose up -d --quiet-pull 2>/dev/null; then
-        # Fallback для старых версий docker-compose
         docker-compose -f "$COMPOSE_FILE" up -d --quiet-pull 2>/dev/null || docker run -d \
             --name "$CONTAINER_NAME" \
             --restart unless-stopped \
@@ -301,7 +344,6 @@ start_proxy() {
     
     sleep 3
     
-    # Проверка запуска
     if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
         log_info "✅ Прокси запущен"
         return 0
@@ -309,6 +351,63 @@ start_proxy() {
         log_error "Не удалось запустить контейнер. Проверьте логи: docker logs $CONTAINER_NAME"
         return 1
     fi
+}
+
+# ================= ИНТЕРАКТИВНЫЙ ВЫБОР =================
+
+prompt_target() {
+    echo -e "\n${YELLOW}🔹 Выберите тип идентификатора для прокси:${NC}"
+    echo "  1) Использовать домен (например, proxy.example.com)"
+    echo "  2) Использовать публичный IP-адрес"
+    echo -n "Ваш выбор [1/2]: "
+    read -r CHOICE
+    
+    case "$CHOICE" in
+        1)
+            echo -e "\n${YELLOW}📋 Введите ваш домен:${NC}"
+            echo -n "> "
+            read -r TARGET
+            if ! is_valid_domain "$TARGET"; then
+                log_error "Некорректный формат домена"
+                exit 1
+            fi
+            MODE="domain"
+            ;;
+        2)
+            # Автоопределение внешнего IP
+            log_info "🔍 Определение публичного IP-адреса..."
+            DETECTED_IP=$(get_public_ip)
+            
+            if [[ -z "$DETECTED_IP" ]]; then
+                log_error "Не удалось автоматически определить внешний IP"
+                echo -e "\n${YELLOW}📋 Введите ваш публичный IP-адрес вручную:${NC}"
+                echo -n "> "
+                read -r TARGET
+            else
+                echo -e "\n${GREEN}✅ Обнаружен внешний IP: ${DETECTED_IP}${NC}"
+                echo -e "${YELLOW}📋 Нажмите Enter для использования обнаруженного IP, или введите другой:${NC}"
+                echo -n "> "
+                read -r USER_INPUT
+                if [[ -z "$USER_INPUT" ]]; then
+                    TARGET="$DETECTED_IP"
+                    log_info "Будет использован обнаруженный IP: $TARGET"
+                else
+                    TARGET="$USER_INPUT"
+                    log_info "Будет использован указанный IP: $TARGET"
+                fi
+            fi
+            
+            if ! is_valid_public_ip "$TARGET"; then
+                log_error "Некорректный или приватный IP-адрес: $TARGET"
+                exit 1
+            fi
+            MODE="ip"
+            ;;
+        *)
+            log_error "Неверный выбор. Перезапустите скрипт."
+            exit 1
+            ;;
+    esac
 }
 
 # ================= ОСНОВНАЯ ЛОГИКА =================
@@ -320,55 +419,41 @@ elif [[ "${1:-}" == "--renew-key" ]]; then
     renew_key
 fi
 
-# Если аргументы не распознаны — режим установки
+# Режим установки
 log_info "🔧 Режим установки: настройка нового MTProto-прокси"
 
-# Проверка входных данных
-echo -e "\n${YELLOW}📋 Введите домен ИЛИ публичный IP-адрес для прокси:${NC}"
-echo "   Пример домена: domain.example.net"
-echo "   Пример IP: 203.0.113.42"
-echo -n "> "
-read -r TARGET
+# 0. Установка базовых зависимостей
+install_prerequisites
 
-if ! validate_input "$TARGET"; then
-    log_error "Некорректный ввод. Укажите валидный домен или публичный IP"
-    exit 1
-fi
+# 1. Интерактивный выбор: домен или IP
+prompt_target
 
-# Определяем тип ввода
-IS_IP="false"
-if [[ "$TARGET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    IS_IP="true"
-    log_info "🎯 Обнаружен публичный IP: $TARGET"
-else
-    log_info "🎯 Обнаружен домен: $TARGET"
-    # Проверка DNS
-    if ! dig +short "$TARGET" | grep -q .; then
-        log_warn "⚠️ Домен $TARGET не резолвится. Убедитесь, что A-запись указывает на этот сервер."
-        echo -n "Продолжить установку? [y/N]: "
-        read -r CONFIRM
-        [[ "${CONFIRM,,}" != "y" ]] && exit 1
+# 2. Установка Docker
+install_docker
+
+# 3. (Опционально) Проверка резолвинга для домена — только информативно
+if [[ "$MODE" == "domain" ]]; then
+    if ! domain_resolves "$TARGET"; then
+        log_warn "⚠️ Домен '$TARGET' пока не резолвится. Убедитесь, что A-запись обновилась."
+        log_warn "   Это нормально сразу после изменения DNS. Продолжаем установку..."
     fi
 fi
 
-# 1. Установка Docker
-install_docker
-
-# 2. Получение реального сертификата
-if ! get_certificate "$TARGET" "$IS_IP"; then
+# 4. Получение реального сертификата
+if ! get_certificate "$TARGET" "$([[ "$MODE" == "ip" ]] && echo true || echo false)"; then
     log_error "❌ Не удалось получить реальный TLS-сертификат."
     echo -e "\n${YELLOW}Возможные причины:${NC}"
-    echo "  • Порт 80/443 закрыт фаерволом или провайдером"
+    echo "  • Порт 80 закрыт фаерволом или провайдером"
     echo "  • DNS-запись ещё не обновилась (для домена)"
-    echo "  • Лимит запросов Let's Encrypt (5 сертификатов/домен/неделю)"
-    echo -e "\n${YELLOW}Попробуйте:${NC}"
-    echo "  1. Проверьте, что порты 80 и 443 открыты: ss -tlnp | grep -E ':(80|443)'"
-    echo "  2. Для домена: убедитесь, что A-запись указывает на $(curl -s ifconfig.me 2>/dev/null || echo 'ваш IP')"
-    echo "  3. Повторите запуск скрипта через 10-15 минут"
+    echo "  • Лимит запросов Let's Encrypt"
+    echo -e "\n${YELLOW}Проверьте:${NC}"
+    echo "  • ss -tlnp | grep :80  (порт должен быть свободен или слушаться)"
+    echo "  • Для домена: A-запись должна указывать на $(curl -s ifconfig.me 2>/dev/null || echo 'ваш IP')"
+    echo "  • Повторите запуск через 10-15 минут"
     exit 1
 fi
 
-# 3. Генерация ee-секрета (HEX-формат)
+# 5. Генерация ee-секрета
 log_info "🔑 Генерация ee-секрета (MTProto 2.0 + Fake TLS)..."
 SECRET=$(docker run --rm "$IMAGE_TAG" generate-secret --hex "$TARGET" 2>/dev/null | tr -d '\r\n')
 
@@ -377,16 +462,16 @@ if [[ ! "$SECRET" =~ ^ee[0-9a-f]{64}$ ]]; then
     exit 1
 fi
 
-# 4. Создание конфигурации
+# 6. Сохранение домена/IP в конфиг для будущего использования (show-key, renew-key)
+mkdir -p "$PROXY_DIR"
+echo "server = \"$TARGET\"" >> "$CONFIG_FILE"
+
+# 7. Создание конфигурации и запуск
 generate_config "$TARGET" "$SECRET"
-
-# 5. Настройка автообновления сертификатов
 setup_autorenew
-
-# 6. Запуск прокси
 start_proxy
 
-# 7. Финальный вывод
+# 8. Финальный вывод
 echo -e "\n${GREEN}╔════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}║  ✅ MTProto-прокси успешно установлен!    ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════════╝${NC}\n"
