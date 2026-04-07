@@ -325,7 +325,7 @@ log_info "🔧 Режим установки: настройка нового MT
 
 # Проверка входных данных
 echo -e "\n${YELLOW}📋 Введите домен ИЛИ публичный IP-адрес для прокси:${NC}"
-echo "   Пример домена: api.test-front.selarti.com"
+echo "   Пример домена: domain.example.net"
 echo "   Пример IP: 203.0.113.42"
 echo -n "> "
 read -r TARGET
